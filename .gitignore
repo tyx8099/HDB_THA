@@ -1,0 +1,10 @@
+# The assessment brief must not be published.
+*.pdf
+
+# Local Python and notebook artifacts.
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+.env
+.DS_Store
