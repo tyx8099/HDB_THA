@@ -2,7 +2,7 @@
 
 ## Scope and method
 
-This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), restricted to January 2012–December 2017, and the current master and quarantine outputs. Run `python3 part1_data_pipeline/combine.py` before regenerating this report with `python3 part1_data_pipeline/profile.py`. Source CSVs are never edited. The master is the set that passes the four exact January 2012 category checks; the quarantine contains failed records with reasons. Further transformations and hashing are pending.
+This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), restricted to January 2012–December 2017, and the current master, cleaned, and quarantine outputs. Run `combine.py`, `lease.py`, and `price_anomalies.py` in that order before regenerating this report with `profile.py`. Source CSVs are never edited. The master is the set that passes the four exact January 2012 category checks; the quarantine contains failed records with reasons. Cleaned adds the as-of-2027 lease calculation and price anomaly review fields. Further transformations and hashing are pending.
 
 ## 1. Source inventory
 
@@ -59,9 +59,10 @@ The reference month has **1,559 records**. These exact values, with no case or s
 | --- | --- | --- |
 | Selected raw | 113,053 | 100.0% |
 | Master | 105,225 | 93.1% |
+| Cleaned | 105,225 | 93.1% |
 | Quarantined | 7,828 | 6.9% |
 
-Every selected raw record appears exactly once across master and quarantine, based on source file and source record number. The two outputs have no overlapping lineage keys, and all source field values match the original CSV records.
+Every selected raw record appears exactly once across master and quarantine, based on source file and source record number. The two outputs have no overlapping lineage keys, and all source field values match the original CSV records. Cleaned has the same accepted records and original field values as master, plus derived lease and price anomaly columns; it is a downstream copy, so its rows are not added again to the raw reconciliation total.
 
 | Source file | Selected raw | Master | Quarantined | Quarantine share |
 | --- | --- | --- | --- | --- |
@@ -94,6 +95,41 @@ A row may fail more than one rule, so the rule counts can sum to more than the n
 | invalid_flat_model | 778 |
 | invalid_flat_model\|invalid_storey_range | 92 |
 
+### Why the rows fail
+
+January 2012 storey bands each span **3 floors** and end at floor **36**. Classifying each quarantined row by its primary mismatch gives:
+
+| Failure mechanism | Rows | Share of quarantine |
+| --- | --- | --- |
+| Different storey-band width | 6,838 | 87.4% |
+| Flat model only | 778 | 9.9% |
+| Above January 2012 floor coverage | 212 | 2.7% |
+
+| Field | Value absent in January 2012 | Rows | First month | Last month |
+| --- | --- | --- | --- | --- |
+| flat_model | DBSS | 583 | 2014-03 | 2017-12 |
+| flat_model | Type S1 | 179 | 2014-12 | 2017-12 |
+| flat_model | Type S2 | 78 | 2015-01 | 2017-11 |
+| flat_model | Improved-Maisonette | 15 | 2012-07 | 2017-10 |
+| flat_model | Premium Maisonette | 8 | 2012-09 | 2017-09 |
+| flat_model | Premium Apartment Loft | 6 | 2015-11 | 2017-10 |
+| flat_model | 2-room | 1 | 2016-10 | 2016-10 |
+| storey_range | 01 TO 05 | 2,700 | 2012-03 | 2012-05 |
+| storey_range | 06 TO 10 | 2,474 | 2012-03 | 2012-05 |
+| storey_range | 11 TO 15 | 1,259 | 2012-03 | 2012-05 |
+| storey_range | 16 TO 20 | 265 | 2012-03 | 2012-05 |
+| storey_range | 37 TO 39 | 125 | 2012-02 | 2017-12 |
+| storey_range | 21 TO 25 | 92 | 2012-03 | 2012-05 |
+| storey_range | 40 TO 42 | 60 | 2012-12 | 2017-12 |
+| storey_range | 26 TO 30 | 39 | 2012-03 | 2012-05 |
+| storey_range | 43 TO 45 | 11 | 2015-02 | 2017-11 |
+| storey_range | 46 TO 48 | 11 | 2015-01 | 2017-09 |
+| storey_range | 36 TO 40 | 7 | 2012-03 | 2012-05 |
+| storey_range | 49 TO 51 | 5 | 2015-07 | 2017-06 |
+| storey_range | 31 TO 35 | 2 | 2012-04 | 2012-04 |
+
+The **6,838 different-width rows** occur in **2012-03, 2012-04, 2012-05**. Their five-floor bands (`01 TO 05`, `06 TO 10`, etc.) do not exactly match January's three-floor bands. This is a temporary source coding difference, not evidence that all those sales are invalid. The **212 higher-floor rows** use three-floor bands above floor 36; the first such row appears in **2012-02**. **92 rows** fail both storey and flat-model checks, so the two field-level failure totals overlap.
+
 **Months with no accepted records:** 2012-03, 2012-04, 2012-05. In March–May 2012, the registration-date source uses storey bands such as `01 TO 05` and `06 TO 10`; January 2012 uses `01 TO 03`, `04 TO 06`, and similar three-floor bands. The strict reference rule therefore quarantines every record in those three months. Quarantine means a rule failed; it does not prove the sale or source value is erroneous.
 
 ## 6. Numeric behaviour
@@ -111,7 +147,43 @@ A row may fail more than one rule, so the rule counts can sum to more than the n
 
 Lease commencement years range from **1966** to **2015**. There are **0** non-numeric commencement years or years later than their transaction year.
 
-The numeric summaries are descriptive. No price-anomaly heuristic has been applied yet; an unusually high price should be evaluated against comparable town, flat type, time, and area rather than a single global threshold.
+### Remaining lease on 1 January 2027
+
+The source records `lease_commence_date` as a year. Assuming commencement on 1 January of that year and a 99-year term, the cleaned output has the following derived values:
+
+| Metric | Value |
+| --- | --- |
+| Cleaned records | 105,225 |
+| Minimum full years remaining | 38 |
+| Maximum full years remaining | 87 |
+| Records with a nonzero month component | 0 |
+| Records retaining a nonblank source remaining_lease | 56,793 |
+
+Because both the assumed lease start and the requested as-of date are 1 January, all calculated month components are zero. The source does not give a commencement month, so actual month precision cannot be recovered. The source `remaining_lease` field is measured at a different date and is preserved unchanged, not used in this calculation.
+
+### Potential resale price anomalies
+
+For each accepted record, calculate resale price divided by floor area (SGD/sqm), then compare its log value with transactions in the same **calendar year, town, and flat type**. The robust score is `0.6745 × (log(price/sqm) − peer median) / peer MAD`, where MAD is the median absolute deviation. A score above +3.5 is `high`; below −3.5 is `low`. Groups need at least 30 records and nonzero MAD. Each record is included in its own peer group.
+
+| Status | Rows | Share of cleaned |
+| --- | --- | --- |
+| high | 675 | 0.6% |
+| low | 80 | <0.1% |
+| normal | 102,201 | 97.1% |
+| insufficient_peers | 2,269 | 2.2% |
+| zero_mad | 0 | 0.0% |
+| invalid_numeric | 0 | 0.0% |
+
+The cutoff is ±3.5. The `price_anomaly_flag` is true only for high and low scores. Unassessed rows remain explicitly marked. All records stay in cleaned output; these are review leads, not proven data errors. Flat age, exact floor, model, and other property differences are not controlled by this heuristic and may explain unusual prices.
+
+| Direction | Month | Town | Flat type | Price (SGD) | Area (sqm) | SGD/sqm | Robust score |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| High | 2016-04 | BEDOK | 3 ROOM | 498000 | 62 | 8032.26 | 8.625 |
+| High | 2016-09 | BEDOK | 3 ROOM | 498000 | 62 | 8032.26 | 8.625 |
+| High | 2016-09 | ANG MO KIO | 3 ROOM | 570000 | 70 | 8142.86 | 8.054 |
+| Low | 2012-10 | YISHUN | 4 ROOM | 247000 | 104 | 2375.00 | -6.409 |
+| Low | 2017-11 | SENGKANG | 3 ROOM | 335000 | 88 | 3806.82 | -6.213 |
+| Low | 2016-10 | SENGKANG | 3 ROOM | 323000 | 83 | 3891.57 | -5.511 |
 
 ## 7. Monthly reconciliation
 
@@ -193,6 +265,6 @@ The numeric summaries are descriptive. No price-anomaly heuristic has been appli
 ## Assumptions and follow-up
 
 - January 2012 observed values are used as exact allowlists because the assessment calls them strictly authoritative. Newly introduced but plausible later values are quarantined.
-- The 2015-onward source `remaining_lease` is measured at the resale application, not as of 1 January 2027. The requested new value still needs a consistent calculation.
+- The 2015-onward source `remaining_lease` is measured at the resale application, not as of 1 January 2027. The new value assumes a 1 January lease start because only the commencement year is available.
 - Repeated attribute patterns are not removed pending a defensible duplicate rule.
-- This is the raw-to-master profile. Extend it after producing cleaned, transformed, and hashed outputs so the final report covers the complete pipeline lifecycle.
+- This profile covers raw, master, cleaned, and quarantine. Extend it after producing transformed and hashed outputs so the final report covers the complete pipeline lifecycle.

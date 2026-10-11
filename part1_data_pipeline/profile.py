@@ -1,11 +1,14 @@
 """Generate a Markdown profile of the raw, master, and quarantined records."""
 
 import argparse
+import re
 from pathlib import Path
 
 import pandas as pd
 
 from combine import REFERENCE_COLUMNS
+from lease import remaining_lease
+from price_anomalies import ANOMALY_COLUMNS, MIN_PEERS, ROBUST_Z_THRESHOLD, score_prices
 
 
 PART1 = Path(__file__).parent
@@ -13,6 +16,7 @@ COMMON_FIELDS = (
     "month", "town", "flat_type", "block", "street_name", "storey_range",
     "floor_area_sqm", "flat_model", "lease_commence_date", "resale_price",
 )
+STOREY_PATTERN = re.compile(r"(\d+) TO (\d+)\Z")
 
 
 def table(headers, rows):
@@ -71,10 +75,31 @@ def numeric_summary(frame):
     return price, area, price_per_sqm
 
 
-def generate(raw_dir, master_path, quarantine_path):
+def storey_bounds(value):
+    match = STOREY_PATTERN.fullmatch(value)
+    return tuple(map(int, match.groups())) if match else None
+
+
+def failure_mechanism(row, widths, highest_reference_floor):
+    """Explain the primary shape of a rejected row without changing its reason codes."""
+    if "invalid_storey_range" not in row["quarantine_reasons"]:
+        return "Flat model only"
+    bounds = storey_bounds(row["storey_range"])
+    if bounds is None:
+        return "Unparseable storey band"
+    lower, upper = bounds
+    if upper - lower + 1 not in widths:
+        return "Different storey-band width"
+    if lower > highest_reference_floor:
+        return "Above January 2012 floor coverage"
+    return "Other storey value outside reference"
+
+
+def generate(raw_dir, master_path, quarantine_path, cleaned_path):
     raw, inventory = read_raw(raw_dir)
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     quarantine = pd.read_csv(quarantine_path, dtype=str, keep_default_na=False)
+    cleaned = pd.read_csv(cleaned_path, dtype=str, keep_default_na=False)
 
     # Reconcile by source position before reporting any derived statistics.
     key = ["source_file", "source_record_number"]
@@ -93,6 +118,27 @@ def generate(raw_dir, master_path, quarantine_path):
     for column in list(COMMON_FIELDS) + ["remaining_lease"]:
         if not compared[f"{column}_raw"].eq(compared[f"{column}_output"]).all():
             raise ValueError(f"Output value differs from source: {column}")
+    cleaned_keys = set(map(tuple, cleaned[key].itertuples(index=False, name=None)))
+    if len(cleaned_keys) != len(cleaned) or cleaned_keys != master_keys:
+        raise ValueError("Cleaned records do not match the accepted master records")
+    compared_cleaned = master.merge(cleaned, on=key, suffixes=("_master", "_cleaned"),
+                                    validate="one_to_one")
+    for column in master.columns.drop(key):
+        if not compared_cleaned[f"{column}_master"].eq(
+            compared_cleaned[f"{column}_cleaned"]
+        ).all():
+            raise ValueError(f"Cleaned output changed a master source value: {column}")
+    expected_lease = cleaned["lease_commence_date"].map(remaining_lease)
+    if (not cleaned["remaining_lease_2027_years"].eq(expected_lease.map(lambda value: str(value[0]))).all()
+            or not cleaned["remaining_lease_2027_months"].eq(expected_lease.map(lambda value: str(value[1]))).all()
+            or not cleaned["remaining_lease_2027"].eq(
+                expected_lease.map(lambda value: f"{value[0]} years {value[1]:02d} months")
+            ).all()):
+        raise ValueError("Cleaned output has an incorrect as-of-2027 remaining lease")
+    expected_anomalies = score_prices(cleaned)
+    for column in ANOMALY_COLUMNS:
+        if column not in cleaned or not cleaned[column].eq(expected_anomalies[column]).all():
+            raise ValueError(f"Cleaned output has an incorrect price anomaly value: {column}")
 
     baseline = raw.loc[raw["month"].eq("2012-01")]
     reference = {column: set(baseline.loc[baseline[column].ne(""), column])
@@ -116,11 +162,13 @@ def generate(raw_dir, master_path, quarantine_path):
         "## Scope and method",
         "",
         "This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), "
-        "restricted to January 2012–December 2017, and the current master and quarantine outputs. "
-        "Run `python3 part1_data_pipeline/combine.py` before regenerating this report with "
-        "`python3 part1_data_pipeline/profile.py`. Source CSVs are never edited. "
+        "restricted to January 2012–December 2017, and the current master, cleaned, and quarantine outputs. "
+        "Run `combine.py`, `lease.py`, and `price_anomalies.py` in that order before regenerating "
+        "this report with `profile.py`. Source CSVs are never edited. "
         "The master is the set that passes the four exact January 2012 category checks; "
-        "the quarantine contains failed records with reasons. Further transformations and hashing are pending.",
+        "the quarantine contains failed records with reasons. Cleaned adds the as-of-2027 lease calculation "
+        "and price anomaly review fields. "
+        "Further transformations and hashing are pending.",
         "",
         "## 1. Source inventory",
         "",
@@ -179,12 +227,15 @@ def generate(raw_dir, master_path, quarantine_path):
         table(["Output", "Records", "Share of selected raw"], [
             ("Selected raw", number(len(raw)), "100.0%"),
             ("Master", number(len(master)), percent(len(master), len(raw))),
+            ("Cleaned", number(len(cleaned)), percent(len(cleaned), len(raw))),
             ("Quarantined", number(len(quarantine)), percent(len(quarantine), len(raw))),
         ]),
         "",
         "Every selected raw record appears exactly once across master and quarantine, based on source file "
         "and source record number. The two outputs have no overlapping lineage keys, and all source "
-        "field values match the original CSV records.",
+        "field values match the original CSV records. Cleaned has the same accepted records and original "
+        "field values as master, plus derived lease and price anomaly columns; it is a downstream copy, so its rows "
+        "are not added again to the raw reconciliation total.",
         "",
     ]
 
@@ -225,6 +276,61 @@ def generate(raw_dir, master_path, quarantine_path):
         "",
     ]
 
+    reference_bounds = [storey_bounds(value) for value in reference["storey_range"]]
+    if any(bounds is None for bounds in reference_bounds):
+        raise ValueError("January 2012 has an unparseable storey range")
+    widths = {upper - lower + 1 for lower, upper in reference_bounds}
+    highest_reference_floor = max(upper for _, upper in reference_bounds)
+    mechanisms = quarantine.apply(
+        failure_mechanism, axis=1,
+        args=(widths, highest_reference_floor),
+    )
+    mechanism_counts = mechanisms.value_counts()
+    lines += [
+        "### Why the rows fail",
+        "",
+        f"January 2012 storey bands each span **{', '.join(map(str, sorted(widths)))} floors** "
+        f"and end at floor **{highest_reference_floor}**. Classifying each quarantined row by its "
+        "primary mismatch gives:",
+        "",
+        table(["Failure mechanism", "Rows", "Share of quarantine"],
+              [(mechanism, number(count), percent(count, len(quarantine)))
+               for mechanism, count in mechanism_counts.items()]),
+        "",
+    ]
+
+    unexpected_rows = []
+    for column in ("storey_range", "flat_model"):
+        failed = quarantine.loc[quarantine["quarantine_reasons"].str.contains(
+            f"invalid_{column}", regex=False
+        )]
+        for value, group in failed.groupby(column):
+            unexpected_rows.append((column, value, len(group), group["month"].min(), group["month"].max()))
+    unexpected_rows.sort(key=lambda item: (item[0], -item[2], item[1]))
+    lines += [
+        table(["Field", "Value absent in January 2012", "Rows", "First month", "Last month"],
+              [(column, value, number(count), first, last)
+               for column, value, count, first, last in unexpected_rows]),
+        "",
+    ]
+
+    width_rows = quarantine.loc[mechanisms.eq("Different storey-band width")]
+    width_months = ", ".join(sorted(width_rows["month"].unique()))
+    high_rows = quarantine.loc[mechanisms.eq("Above January 2012 floor coverage")]
+    both_count = int(quarantine["quarantine_reasons"].eq(
+        "invalid_flat_model|invalid_storey_range").sum())
+    lines += [
+        f"The **{number(len(width_rows))} different-width rows** occur in **{width_months}**. "
+        "Their five-floor bands (`01 TO 05`, `06 TO 10`, etc.) do not exactly match January's "
+        "three-floor bands. This is a temporary source coding difference, not evidence that all "
+        "those sales are invalid. "
+        f"The **{number(len(high_rows))} higher-floor rows** use three-floor bands above floor "
+        f"{highest_reference_floor}; the first such row appears in **{high_rows['month'].min()}**. "
+        f"**{number(both_count)} rows** fail both storey and flat-model checks, so the two "
+        "field-level failure totals overlap.",
+        "",
+    ]
+
     raw_month = raw.groupby("month").size()
     master_month = master.groupby("month").size()
     quarantine_month = quarantine.groupby("month").size()
@@ -258,9 +364,52 @@ def generate(raw_dir, master_path, quarantine_path):
         f"There are **{number(impossible_lease_years)}** non-numeric commencement years or years later "
         "than their transaction year.",
         "",
-        "The numeric summaries are descriptive. No price-anomaly heuristic has been applied yet; an "
-        "unusually high price should be evaluated against comparable town, flat type, time, and area "
-        "rather than a single global threshold.",
+        "### Remaining lease on 1 January 2027",
+        "",
+        "The source records `lease_commence_date` as a year. Assuming commencement on 1 January of that "
+        "year and a 99-year term, the cleaned output has the following derived values:",
+        "",
+        table(["Metric", "Value"], [
+            ("Cleaned records", number(len(cleaned))),
+            ("Minimum full years remaining", cleaned["remaining_lease_2027_years"].astype(int).min()),
+            ("Maximum full years remaining", cleaned["remaining_lease_2027_years"].astype(int).max()),
+            ("Records with a nonzero month component", number(int(cleaned["remaining_lease_2027_months"].ne("0").sum()))),
+            ("Records retaining a nonblank source remaining_lease", number(int(cleaned["remaining_lease"].ne("").sum()))),
+        ]),
+        "",
+        "Because both the assumed lease start and the requested as-of date are 1 January, all calculated "
+        "month components are zero. The source does not give a commencement month, so actual month "
+        "precision cannot be recovered. The source `remaining_lease` field is measured at a different "
+        "date and is preserved unchanged, not used in this calculation.",
+        "",
+        "### Potential resale price anomalies",
+        "",
+        "For each accepted record, calculate resale price divided by floor area (SGD/sqm), then compare "
+        "its log value with transactions in the same **calendar year, town, and flat type**. The robust "
+        "score is `0.6745 × (log(price/sqm) − peer median) / peer MAD`, where MAD is the median "
+        "absolute deviation. A score above +3.5 is `high`; below −3.5 is `low`. Groups need at "
+        f"least {MIN_PEERS} records and nonzero MAD. Each record is included in its own peer group.",
+        "",
+        table(["Status", "Rows", "Share of cleaned"], [
+            (status, number(int((cleaned["price_anomaly_status"] == status).sum())),
+             percent(int((cleaned["price_anomaly_status"] == status).sum()), len(cleaned)))
+            for status in ("high", "low", "normal", "insufficient_peers", "zero_mad", "invalid_numeric")
+        ]),
+        "",
+        f"The cutoff is ±{ROBUST_Z_THRESHOLD}. The `price_anomaly_flag` is true only for high and low scores. "
+        "Unassessed rows remain explicitly marked. All records stay in cleaned output; these are "
+        "review leads, not proven data errors. Flat age, exact floor, model, and other property "
+        "differences are not controlled by this heuristic and may explain unusual prices.",
+        "",
+        table(["Direction", "Month", "Town", "Flat type", "Price (SGD)", "Area (sqm)",
+               "SGD/sqm", "Robust score"], [
+            (direction, row["month"], row["town"], row["flat_type"], row["resale_price"],
+             row["floor_area_sqm"], row["price_per_sqm"], row["price_anomaly_robust_z"])
+            for direction, ascending in (("High", False), ("Low", True))
+            for _, row in cleaned.loc[cleaned["price_anomaly_status"].eq(direction.lower())].sort_values(
+                "price_anomaly_robust_z", key=lambda series: pd.to_numeric(series), ascending=ascending
+            ).head(3).iterrows()
+        ]),
         "",
         "## 7. Monthly reconciliation",
         "",
@@ -275,10 +424,11 @@ def generate(raw_dir, master_path, quarantine_path):
         "- January 2012 observed values are used as exact allowlists because the assessment calls them "
         "strictly authoritative. Newly introduced but plausible later values are quarantined.",
         "- The 2015-onward source `remaining_lease` is measured at the resale application, not as of "
-        "1 January 2027. The requested new value still needs a consistent calculation.",
+        "1 January 2027. The new value assumes a 1 January lease start because only the commencement "
+        "year is available.",
         "- Repeated attribute patterns are not removed pending a defensible duplicate rule.",
-        "- This is the raw-to-master profile. Extend it after producing cleaned, transformed, and hashed "
-        "outputs so the final report covers the complete pipeline lifecycle.",
+        "- This profile covers raw, master, cleaned, and quarantine. Extend it after producing transformed "
+        "and hashed outputs so the final report covers the complete pipeline lifecycle.",
         "",
     ]
     return "\n".join(lines)
@@ -289,9 +439,10 @@ def main():
     parser.add_argument("--raw-dir", type=Path, default=PART1 / "data" / "raw")
     parser.add_argument("--master", type=Path, default=PART1 / "data" / "master" / "resale_master_2012_2017.csv")
     parser.add_argument("--quarantine", type=Path, default=PART1 / "data" / "quarantined" / "resale_quarantined_2012_2017.csv")
+    parser.add_argument("--cleaned", type=Path, default=PART1 / "data" / "cleaned" / "resale_cleaned_2012_2017.csv")
     parser.add_argument("--output", type=Path, default=PART1 / "DATA_PROFILING_REPORT.md")
     args = parser.parse_args()
-    report = generate(args.raw_dir, args.master, args.quarantine)
+    report = generate(args.raw_dir, args.master, args.quarantine, args.cleaned)
     args.output.write_text(report, encoding="utf-8")
     print(f"Wrote {args.output}")
 
