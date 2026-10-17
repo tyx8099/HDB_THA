@@ -63,6 +63,30 @@ are flagged when the peer group has at least 30 records and nonzero median
 absolute deviation. Small or constant groups are marked unassessed. All rows
 remain in cleaned output; unusual prices may reflect real property differences.
 
+## Transform resale identifiers
+
+Run after the cleaning steps:
+
+```sh
+.venv/bin/python part1_data_pipeline/transform.py
+```
+
+This writes `data/transformed/resale_transformed_2012_2017.csv`. It adds the
+assessment's readable `resale_identifier`: `S`, the first three numeric block
+characters (left-padded), the first three digits of the grouped average resale
+price, `YYMM`, and the town's first character. The implementation follows the
+brief's `2012-01` → `1201` example for the four-digit date component.
+
+The base identifier currently remains non-unique where the required parts
+collide. The script reports the collision count without dropping records;
+collision resolution and identifier hashing will be added in the next step.
+
+Run the transformation tests with:
+
+```sh
+.venv/bin/python -m pytest part1_data_pipeline/test_transform.py
+```
+
 ## Explore the data in Jupyter
 
 From the repository root, install the notebook dependencies and open
