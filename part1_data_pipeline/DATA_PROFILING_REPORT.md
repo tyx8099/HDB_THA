@@ -2,7 +2,7 @@
 
 ## Scope and method
 
-This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), restricted to January 2012–December 2017, and the current master, cleaned, and quarantine outputs. Run `combine.py`, `lease.py`, and `price_anomalies.py` in that order before regenerating this report with `profile.py`. Source CSVs are never edited. The master is the set that passes the four exact January 2012 category checks; the quarantine contains failed records with reasons. Cleaned adds the as-of-2027 lease calculation and price anomaly review fields. Further transformations and hashing are pending.
+This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), restricted to January 2012–December 2017 and all five output groups. Run `combine.py`, `lease.py`, `price_anomalies.py`, `transform.py`, and `hash_identifiers.py` in that order before regenerating this report with `profile.py`. Source CSVs are never edited. The master is the set that passes the four exact January 2012 category checks; the quarantine contains failed records with reasons. Cleaned adds the as-of-2027 lease calculation and price anomaly review fields. Transformed adds a unique readable identifier; hashed replaces the readable values with keyed HMAC-SHA-256 identifiers.
 
 ## 1. Source inventory
 
@@ -60,9 +60,11 @@ The reference month has **1,559 records**. These exact values, with no case or s
 | Selected raw | 113,053 | 100.0% |
 | Master | 105,225 | 93.1% |
 | Cleaned | 105,225 | 93.1% |
+| Transformed | 105,225 | 93.1% |
 | Quarantined | 7,828 | 6.9% |
+| Hashed | 105,225 | 93.1% |
 
-Every selected raw record appears exactly once across master and quarantine, based on source file and source record number. The two outputs have no overlapping lineage keys, and all source field values match the original CSV records. Cleaned has the same accepted records and original field values as master, plus derived lease and price anomaly columns; it is a downstream copy, so its rows are not added again to the raw reconciliation total.
+Every selected raw record appears exactly once across master and quarantine, based on source file and source record number. The two outputs have no overlapping lineage keys, and all source field values match the original CSV records. Cleaned has the same accepted records and original field values as master, plus derived lease and price anomaly columns. Transformed and hashed contain the same accepted lineage keys and preserve every cleaned field. These are downstream copies, so their rows are not added again to the raw reconciliation total.
 
 | Source file | Selected raw | Master | Quarantined | Quarantine share |
 | --- | --- | --- | --- | --- |
@@ -185,7 +187,22 @@ The cutoff is ±3.5. The `price_anomaly_flag` is true only for high and low scor
 | Low | 2017-11 | SENGKANG | 3 ROOM | 335000 | 88 | 3806.82 | -6.213 |
 | Low | 2016-10 | SENGKANG | 3 ROOM | 323000 | 83 | 3891.57 | -5.511 |
 
-## 7. Monthly reconciliation
+## 7. Identifier transformation and de-identification
+
+The readable base identifier combines the fixed `S` prefix, block digits, the first three digits of average resale price within month/town/flat type, `YYMM`, and town initial. Repeated base values are ordered by source file and source record number; the first keeps the base value and later records receive `-002`, `-003`, and so on.
+
+| Metric | Rows |
+| --- | --- |
+| Transformed records | 105,225 |
+| Records in a colliding base-identifier group | 24,406 |
+| Distinct colliding base identifiers | 11,011 |
+| Records receiving a collision suffix | 13,395 |
+| Unique final readable identifiers | 105,225 |
+| Unique hashed identifiers | 105,225 |
+
+No records are dropped during collision resolution. The hashed output applies HMAC-SHA-256 with a private pepper supplied at runtime. It retains the cleaned fields and excludes both readable identifier columns. The report verifies 64-character hexadecimal format and uniqueness; it cannot recompute the secret-keyed values without the pepper, which is intentionally absent from source control.
+
+## 8. Monthly reconciliation
 
 | Month | Selected raw | Master | Quarantined | Quarantine share |
 | --- | --- | --- | --- | --- |
@@ -267,4 +284,5 @@ The cutoff is ±3.5. The `price_anomaly_flag` is true only for high and low scor
 - January 2012 observed values are used as exact allowlists because the assessment calls them strictly authoritative. Newly introduced but plausible later values are quarantined.
 - The 2015-onward source `remaining_lease` is measured at the resale application, not as of 1 January 2027. The new value assumes a 1 January lease start because only the commencement year is available.
 - Repeated attribute patterns are not removed pending a defensible duplicate rule.
-- This profile covers raw, master, cleaned, and quarantine. Extend it after producing transformed and hashed outputs so the final report covers the complete pipeline lifecycle.
+- Collision suffixes are assigned from source lineage so repeated runs over the same input snapshot produce the same readable identifiers.
+- HMAC-SHA-256 uses a private pepper of at least 32 characters. The committed hashed output can be regenerated with a different private pepper, but its digest values will differ by design.

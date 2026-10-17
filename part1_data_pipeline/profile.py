@@ -9,6 +9,7 @@ import pandas as pd
 from combine import REFERENCE_COLUMNS
 from lease import remaining_lease
 from price_anomalies import ANOMALY_COLUMNS, MIN_PEERS, ROBUST_Z_THRESHOLD, score_prices
+from transform import transform
 
 
 PART1 = Path(__file__).parent
@@ -95,11 +96,13 @@ def failure_mechanism(row, widths, highest_reference_floor):
     return "Other storey value outside reference"
 
 
-def generate(raw_dir, master_path, quarantine_path, cleaned_path):
+def generate(raw_dir, master_path, quarantine_path, cleaned_path, transformed_path, hashed_path):
     raw, inventory = read_raw(raw_dir)
     master = pd.read_csv(master_path, dtype=str, keep_default_na=False)
     quarantine = pd.read_csv(quarantine_path, dtype=str, keep_default_na=False)
     cleaned = pd.read_csv(cleaned_path, dtype=str, keep_default_na=False)
+    transformed = pd.read_csv(transformed_path, dtype=str, keep_default_na=False)
+    hashed = pd.read_csv(hashed_path, dtype=str, keep_default_na=False)
 
     # Reconcile by source position before reporting any derived statistics.
     key = ["source_file", "source_record_number"]
@@ -140,6 +143,40 @@ def generate(raw_dir, master_path, quarantine_path, cleaned_path):
         if column not in cleaned or not cleaned[column].eq(expected_anomalies[column]).all():
             raise ValueError(f"Cleaned output has an incorrect price anomaly value: {column}")
 
+    transformed_keys = set(map(tuple, transformed[key].itertuples(index=False, name=None)))
+    hashed_keys = set(map(tuple, hashed[key].itertuples(index=False, name=None)))
+    if (len(transformed_keys) != len(transformed) or transformed_keys != master_keys
+            or len(hashed_keys) != len(hashed) or hashed_keys != master_keys):
+        raise ValueError("Transformed or hashed records do not match the cleaned records")
+    compared_transformed = cleaned.merge(
+        transformed, on=key, suffixes=("_cleaned", "_transformed"), validate="one_to_one"
+    )
+    for column in cleaned.columns.drop(key):
+        if not compared_transformed[f"{column}_cleaned"].eq(
+            compared_transformed[f"{column}_transformed"]
+        ).all():
+            raise ValueError(f"Transformed output changed a cleaned value: {column}")
+    expected_transformed = transform(cleaned)
+    for column in ("resale_identifier_base", "resale_identifier"):
+        if column not in transformed or not transformed[column].eq(expected_transformed[column]).all():
+            raise ValueError(f"Transformed output has an incorrect identifier value: {column}")
+    if not transformed["resale_identifier"].is_unique:
+        raise ValueError("Transformed resale identifiers are not unique")
+    if ({"resale_identifier", "resale_identifier_base"} & set(hashed.columns)
+            or "hashed_resale_identifier" not in hashed):
+        raise ValueError("Hashed output exposes a readable identifier or lacks its hashed identifier")
+    compared_hashed = cleaned.merge(
+        hashed, on=key, suffixes=("_cleaned", "_hashed"), validate="one_to_one"
+    )
+    for column in cleaned.columns.drop(key):
+        if not compared_hashed[f"{column}_cleaned"].eq(
+            compared_hashed[f"{column}_hashed"]
+        ).all():
+            raise ValueError(f"Hashed output changed a cleaned value: {column}")
+    if (not hashed["hashed_resale_identifier"].str.fullmatch(r"[0-9a-f]{64}").all()
+            or not hashed["hashed_resale_identifier"].is_unique):
+        raise ValueError("Hashed identifiers must be unique SHA-256 hex values")
+
     baseline = raw.loc[raw["month"].eq("2012-01")]
     reference = {column: set(baseline.loc[baseline[column].ne(""), column])
                  for column in REFERENCE_COLUMNS}
@@ -162,13 +199,13 @@ def generate(raw_dir, master_path, quarantine_path, cleaned_path):
         "## Scope and method",
         "",
         "This report profiles the original files from the [HDB resale collection](https://data.gov.sg/collections/189/view), "
-        "restricted to January 2012–December 2017, and the current master, cleaned, and quarantine outputs. "
-        "Run `combine.py`, `lease.py`, and `price_anomalies.py` in that order before regenerating "
+        "restricted to January 2012–December 2017 and all five output groups. Run `combine.py`, "
+        "`lease.py`, `price_anomalies.py`, `transform.py`, and `hash_identifiers.py` in that order before regenerating "
         "this report with `profile.py`. Source CSVs are never edited. "
         "The master is the set that passes the four exact January 2012 category checks; "
         "the quarantine contains failed records with reasons. Cleaned adds the as-of-2027 lease calculation "
-        "and price anomaly review fields. "
-        "Further transformations and hashing are pending.",
+        "and price anomaly review fields. Transformed adds a unique readable identifier; hashed replaces "
+        "the readable values with keyed HMAC-SHA-256 identifiers.",
         "",
         "## 1. Source inventory",
         "",
@@ -228,14 +265,17 @@ def generate(raw_dir, master_path, quarantine_path, cleaned_path):
             ("Selected raw", number(len(raw)), "100.0%"),
             ("Master", number(len(master)), percent(len(master), len(raw))),
             ("Cleaned", number(len(cleaned)), percent(len(cleaned), len(raw))),
+            ("Transformed", number(len(transformed)), percent(len(transformed), len(raw))),
             ("Quarantined", number(len(quarantine)), percent(len(quarantine), len(raw))),
+            ("Hashed", number(len(hashed)), percent(len(hashed), len(raw))),
         ]),
         "",
         "Every selected raw record appears exactly once across master and quarantine, based on source file "
         "and source record number. The two outputs have no overlapping lineage keys, and all source "
         "field values match the original CSV records. Cleaned has the same accepted records and original "
-        "field values as master, plus derived lease and price anomaly columns; it is a downstream copy, so its rows "
-        "are not added again to the raw reconciliation total.",
+        "field values as master, plus derived lease and price anomaly columns. Transformed and hashed contain "
+        "the same accepted lineage keys and preserve every cleaned field. These are downstream copies, so their "
+        "rows are not added again to the raw reconciliation total.",
         "",
     ]
 
@@ -411,7 +451,38 @@ def generate(raw_dir, master_path, quarantine_path, cleaned_path):
             ).head(3).iterrows()
         ]),
         "",
-        "## 7. Monthly reconciliation",
+        "## 7. Identifier transformation and de-identification",
+        "",
+        "The readable base identifier combines the fixed `S` prefix, block digits, the first three "
+        "digits of average resale price within month/town/flat type, `YYMM`, and town initial. "
+        "Repeated base values are ordered by source file and source record number; the first keeps "
+        "the base value and later records receive `-002`, `-003`, and so on.",
+        "",
+        table(["Metric", "Rows"], [
+            ("Transformed records", number(len(transformed))),
+            ("Records in a colliding base-identifier group", number(int(
+                transformed["resale_identifier_base"].duplicated(keep=False).sum()
+            ))),
+            ("Distinct colliding base identifiers", number(int(
+                transformed.loc[
+                    transformed["resale_identifier_base"].duplicated(keep=False),
+                    "resale_identifier_base",
+                ].nunique()
+            ))),
+            ("Records receiving a collision suffix", number(int(
+                transformed["resale_identifier"].ne(transformed["resale_identifier_base"]).sum()
+            ))),
+            ("Unique final readable identifiers", number(transformed["resale_identifier"].nunique())),
+            ("Unique hashed identifiers", number(hashed["hashed_resale_identifier"].nunique())),
+        ]),
+        "",
+        "No records are dropped during collision resolution. The hashed output applies HMAC-SHA-256 "
+        "with a private pepper supplied at runtime. It retains the cleaned fields and excludes both "
+        "readable identifier columns. The report verifies 64-character hexadecimal format and uniqueness; "
+        "it cannot recompute the secret-keyed values without the pepper, which is intentionally absent "
+        "from source control.",
+        "",
+        "## 8. Monthly reconciliation",
         "",
         table(["Month", "Selected raw", "Master", "Quarantined", "Quarantine share"],
               [(month, number(raw_month[month]), number(master_month.get(month, 0)),
@@ -427,8 +498,10 @@ def generate(raw_dir, master_path, quarantine_path, cleaned_path):
         "1 January 2027. The new value assumes a 1 January lease start because only the commencement "
         "year is available.",
         "- Repeated attribute patterns are not removed pending a defensible duplicate rule.",
-        "- This profile covers raw, master, cleaned, and quarantine. Extend it after producing transformed "
-        "and hashed outputs so the final report covers the complete pipeline lifecycle.",
+        "- Collision suffixes are assigned from source lineage so repeated runs over the same input snapshot "
+        "produce the same readable identifiers.",
+        "- HMAC-SHA-256 uses a private pepper of at least 32 characters. The committed hashed output can be "
+        "regenerated with a different private pepper, but its digest values will differ by design.",
         "",
     ]
     return "\n".join(lines)
@@ -440,9 +513,13 @@ def main():
     parser.add_argument("--master", type=Path, default=PART1 / "data" / "master" / "resale_master_2012_2017.csv")
     parser.add_argument("--quarantine", type=Path, default=PART1 / "data" / "quarantined" / "resale_quarantined_2012_2017.csv")
     parser.add_argument("--cleaned", type=Path, default=PART1 / "data" / "cleaned" / "resale_cleaned_2012_2017.csv")
+    parser.add_argument("--transformed", type=Path, default=PART1 / "data" / "transformed" / "resale_transformed_2012_2017.csv")
+    parser.add_argument("--hashed", type=Path, default=PART1 / "data" / "hashed" / "resale_hashed_2012_2017.csv")
     parser.add_argument("--output", type=Path, default=PART1 / "DATA_PROFILING_REPORT.md")
     args = parser.parse_args()
-    report = generate(args.raw_dir, args.master, args.quarantine, args.cleaned)
+    report = generate(
+        args.raw_dir, args.master, args.quarantine, args.cleaned, args.transformed, args.hashed
+    )
     args.output.write_text(report, encoding="utf-8")
     print(f"Wrote {args.output}")
 

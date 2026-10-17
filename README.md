@@ -9,7 +9,7 @@ The source datasets are published in the [HDB Resale Flat Prices collection](htt
 The [Part 1 guide](part1_data_pipeline/README.md) explains how to build the
 January 2012–December 2017 master dataset from the original CSV files. The
 [profiling report](part1_data_pipeline/DATA_PROFILING_REPORT.md) records the
-current raw, master, and quarantine findings.
+raw, cleaned, transformed, quarantined, and hashed findings.
 
 Further implementation and run instructions will be added as the assessment
 progresses.

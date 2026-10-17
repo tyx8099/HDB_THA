@@ -71,15 +71,37 @@ Run after the cleaning steps:
 .venv/bin/python part1_data_pipeline/transform.py
 ```
 
-This writes `data/transformed/resale_transformed_2012_2017.csv`. It adds the
-assessment's readable `resale_identifier`: `S`, the first three numeric block
+This writes `data/transformed/resale_transformed_2012_2017.csv`. It adds a
+readable `resale_identifier`: `S`, the first three numeric block
 characters (left-padded), the first three digits of the grouped average resale
 price, `YYMM`, and the town's first character. The implementation follows the
 brief's `2012-01` → `1201` example for the four-digit date component.
 
-The base identifier currently remains non-unique where the required parts
-collide. The script reports the collision count without dropping records;
-collision resolution and identifier hashing will be added in the next step.
+`resale_identifier_base` records the value assembled from those parts. When a
+base identifier repeats, records are ordered by `source_file` and
+`source_record_number`; the first retains the base identifier and later records
+receive `-002`, `-003`, and so on. This makes `resale_identifier` unique without
+dropping records.
+
+## Hash resale identifiers
+
+Set a private pepper of at least 32 characters, then run:
+
+```sh
+export HDB_IDENTIFIER_PEPPER="replace-with-a-private-random-value"
+.venv/bin/python part1_data_pipeline/hash_identifiers.py
+```
+
+`.env.example` contains a demonstration value for reference. Replace it before
+running the hashing step; a committed example value does not protect against
+dictionary attacks.
+
+This writes `data/hashed/resale_hashed_2012_2017.csv`. The script applies
+HMAC-SHA-256 to each unique `resale_identifier`. The secret pepper prevents an
+attacker from reproducing hashes from guessed identifiers. The hashed output
+contains `hashed_resale_identifier` and excludes both readable identifier
+columns. `.env.example` documents the required variable; the real pepper and
+`.env` remain outside source control.
 
 Run the transformation tests with:
 
@@ -89,19 +111,22 @@ Run the transformation tests with:
 
 ## Explore the data in Jupyter
 
-From the repository root, install the notebook dependencies and open
-`notebooks/01_eda.ipynb`:
+From the repository root, install the notebook dependencies:
 
 ```sh
 python3 -m venv .venv
 .venv/bin/python -m pip install -r part1_data_pipeline/requirements.txt
-.venv/bin/jupyter lab part1_data_pipeline/notebooks/01_eda.ipynb
+.venv/bin/jupyter lab part1_data_pipeline/notebooks/
 ```
 
-Run all cells in order. The notebook reads the committed raw CSVs, invokes the
-same merge, lease, and anomaly functions, profiles the raw, master, cleaned, and
-quarantined records, and recreates the output CSVs and
-`DATA_PROFILING_REPORT.md`. Its saved cell outputs are included for review.
+Run `01_eda.ipynb` first. It reads the committed raw CSVs, explores their
+behaviour, applies the January 2012 validation, and creates the cleaned output
+with lease and anomaly fields.
+
+Then run `02_transformation.ipynb` with `HDB_IDENTIFIER_PEPPER` set. It creates
+the unique readable identifiers, writes the hashed output, and regenerates
+`DATA_PROFILING_REPORT.md` across all five output groups. Both notebooks include
+saved cell outputs for review.
 
 To regenerate the profiling report without opening Jupyter, run:
 
@@ -109,11 +134,10 @@ To regenerate the profiling report without opening Jupyter, run:
 .venv/bin/python part1_data_pipeline/profile.py
 ```
 
-The report checks row-level reconciliation, source-value preservation, and the
-lease and price anomaly calculations before writing its tables and findings. It will be extended
-as transformed and hashed output groups are implemented.
+The report checks row-level reconciliation, source-value preservation, lease and
+price anomaly calculations, identifier uniqueness, and hashed output before
+writing its tables and findings.
 
 This strict rule quarantines all March–May 2012 records: their source file uses
 different storey-range bands from January 2012. That consequence is retained
-and is described in the profiling report. Further transformations are
-subsequent pipeline steps.
+and is described in the profiling report.
