@@ -1,10 +1,11 @@
 # HDB resale data pipeline
 
-This repository contains a Python pipeline for HDB resale transactions from
-January 2012 through December 2017. It combines the original files, validates
-records against January 2012, profiles data quality, calculates remaining
-lease, flags potential price anomalies, creates unique resale identifiers, and
-produces a de-identified output.
+This repository contains two related deliverables for HDB resale transactions
+from January 2012 to December 2017:
+
+1. A Python pipeline for profiling, validating, transforming, and
+   de-identifying the data.
+2. An AWS architecture for scheduled ingestion and private Tableau access.
 
 The source files come from the
 [HDB Resale Flat Prices collection](https://data.gov.sg/collections/189/view).
@@ -34,14 +35,17 @@ part1_data_pipeline/
 └── README.md
 
 part2_architecture/
+├── hdb_aws_architecture.png
+└── README.md
 ```
 
-The [Part 1 guide](part1_data_pipeline/README.md) describes each pipeline step
-in detail. The
-[profiling report](part1_data_pipeline/DATA_PROFILING_REPORT.md) contains the
-data findings, assumptions, quarantine analysis, and lifecycle reconciliation.
+## Part 1: data pipeline
 
-## Setup
+The pipeline uses the values observed in January 2012 as strict allowlists for
+`town`, `flat_type`, `flat_model`, and `storey_range`. Records with later values
+outside those sets are retained in quarantine with their failure reasons.
+
+### Setup
 
 Python 3.10 or newer is required. From the repository root:
 
@@ -50,9 +54,7 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r part1_data_pipeline/requirements.txt
 ```
 
-## Run the pipeline
-
-Run the scripts in this order:
+### Run
 
 ```sh
 .venv/bin/python part1_data_pipeline/combine.py
@@ -65,44 +67,41 @@ export HDB_IDENTIFIER_PEPPER="replace-with-a-private-random-value"
 ```
 
 `HDB_IDENTIFIER_PEPPER` must contain at least 32 characters. The value in
-`.env.example` is for demonstration only. A real pepper must remain private and
-outside source control. Hashes generated with different peppers will differ by
-design.
+`.env.example` is only an example; the real secret must remain outside source
+control.
 
-## Output groups
+### Outputs
 
 | Output | Description |
 | --- | --- |
-| Raw | Four original source CSVs, stored unchanged |
-| Master | All in-scope records before the validation split |
-| Cleaned | Records passing the January 2012 validation, with lease and anomaly fields |
-| Transformed | Cleaned records with unique readable resale identifiers |
-| Quarantined | Records failing one or more authoritative-value checks, with reasons |
-| Hashed | Cleaned fields with a unique HMAC-SHA-256 identifier and no readable identifier |
+| Raw | Four unchanged source CSVs |
+| Master | In-scope records that pass the strict January 2012 validation |
+| Quarantined | Records that fail one or more authoritative-value checks, with reasons |
+| Cleaned | Master records with remaining-lease and price-anomaly fields |
+| Transformed | Cleaned records with deterministic unique resale identifiers |
+| Hashed | Cleaned fields with unique HMAC-SHA-256 identifiers and no readable identifiers |
 
-The selected raw data contains 113,053 records. Validation produces 105,225
-cleaned records and 7,828 quarantined records. Master and quarantine reconcile
-to every in-scope source row using `source_file` and `source_record_number`.
+The four source files contain 113,053 in-scope records. Strict validation
+produces 105,225 master records and 7,828 quarantined records. Together, those
+outputs preserve every in-scope source row and retain its source file and row
+number.
 
-## Notebooks
+### Notebooks and tests
 
-Start Jupyter Lab with:
+The executed notebooks contain saved cell outputs:
+
+1. `01_eda.ipynb` covers profiling, validation, lease calculation, and anomaly
+   detection.
+2. `02_transformation.ipynb` creates unique identifiers and the de-identified
+   output.
+
+Set `HDB_IDENTIFIER_PEPPER` before starting Jupyter to run the second notebook.
+
+Open them with:
 
 ```sh
 .venv/bin/jupyter lab part1_data_pipeline/notebooks/
 ```
-
-Run the notebooks in order:
-
-1. `01_eda.ipynb` explores the raw data, applies validation, calculates lease,
-   and flags potential price anomalies.
-2. `02_transformation.ipynb` creates unique identifiers, produces the hashed
-   output, and generates the final profiling report.
-
-Both notebooks include saved cell outputs. The second notebook requires
-`HDB_IDENTIFIER_PEPPER` in the environment before Jupyter is started.
-
-## Tests
 
 Run the transformation and hashing tests with:
 
@@ -110,19 +109,35 @@ Run the transformation and hashing tests with:
 .venv/bin/python -m pytest part1_data_pipeline/test_transform.py
 ```
 
-## Main assumptions
+See the [Part 1 guide](part1_data_pipeline/README.md) for the processing rules
+and the [data profiling report](part1_data_pipeline/DATA_PROFILING_REPORT.md)
+for findings, assumptions, and quarantine analysis.
 
-- January 2012 observed values are exact allowlists for `town`, `flat_type`,
-  `flat_model`, and `storey_range`.
-- The source provides only a lease commencement year. The 99-year lease is
-  assumed to start on 1 January of that year when calculating the balance on
-  1 January 2027.
-- Price anomalies are review flags based on robust peer-group comparisons;
-  flagged records remain in the cleaned output.
-- Repeated base identifiers are resolved deterministically using source lineage
-  and suffixes such as `-002` and `-003`. No records are dropped.
-- HMAC-SHA-256 with a private pepper protects the predictable identifier format
-  against straightforward dictionary attacks.
+## Part 2: AWS architecture
 
-Part 2 will add the AWS ingestion and data-exploitation architecture diagrams
-under `part2_architecture/`.
+The architecture covers:
+
+1. A scheduled batch pipeline from data.gov.sg through Lambda and Glue into
+   raw, curated, and quarantine S3 layers.
+2. Private Tableau access through Site-to-Site VPN, an internal load balancer,
+   and approved Athena views.
+
+Lambda streams large downloads into S3 multipart uploads. Glue performs data
+validation and transformation, writes versioned Parquet folders partitioned by
+transaction year, and publishes validated output through the Glue Data Catalog.
+
+See the [architecture diagram](part2_architecture/hdb_aws_architecture.png) and
+the [Part 2 design notes](part2_architecture/README.md) for the complete flow,
+security controls, assumptions, and trade-offs.
+
+## Key assumptions
+
+- A 99-year lease begins on 1 January of `lease_commence_date` because the
+  source provides only the commencement year.
+- Remaining lease is calculated as of 1 January 2027.
+- Price anomaly flags are review indicators. Flagged records remain in the
+  cleaned output.
+- Repeated base identifiers receive deterministic rank suffixes; no records are
+  dropped.
+- HMAC-SHA-256 uses a private pepper to protect the predictable identifier from
+  dictionary attacks.
